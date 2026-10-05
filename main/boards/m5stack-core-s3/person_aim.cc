@@ -30,8 +30,10 @@ FrameStat AnalyzeFrame(const uint8_t* yuyv, size_t len, uint16_t w, uint16_t h,
                 Cr >= t.cr_min && Cr <= t.cr_max) {
                 o.skin++;
                 sx += col; sy += row;
-                if (col < minx) minx = col; if (col > maxx) maxx = col;
-                if (row < miny) miny = row; if (row > maxy) maxy = row;
+                if (col < minx) minx = col;
+                if (col > maxx) maxx = col;
+                if (row < miny) miny = row;
+                if (row > maxy) maxy = row;
             }
         }
     }
