@@ -8,6 +8,7 @@
 #include "axp2101.h"
 #include "mcp_server.h"
 #include "notify_http_server.h"
+#include "person_aim.h"
 
 #include <esp_log.h>
 #include <esp_heap_caps.h>
@@ -56,6 +57,65 @@ static void Bmi270DelayUs(uint32_t period_us, void *intf_ptr) {
 }
 
 #define TAG "M5StackCoreS3Board"
+
+// ================= 任务11：主动搭话（安静 15 分钟自己来搭一次）================
+#ifndef PROACTIVE_TALK
+#define PROACTIVE_TALK 1      // 默认开；想关掉对比就把这里改成 0
+#endif
+
+#if PROACTIVE_TALK
+// 计时：最近一次互动（任何走服务端的回合都算）_us
+static int64_t g_last_interaction_us = 0;
+static int64_t g_last_proactive_us  = 0;
+// 滑动 1 小时窗口：最多 4 次，存 4 个时间戳（重连不清零）
+static int64_t g_proactive_hour[4] = {0, 0, 0, 0};
+
+// 每一次互动都刷新冷场计时（由 SendUserMessage 统一调用）
+static void RecordInteraction() {
+    g_last_interaction_us = esp_timer_get_time();
+}
+
+// 是否允许主动搭话：冷场≥15分钟 && 距上次主动≥5分钟 && 1小时内<4次
+static bool ProactiveAllowed() {
+    int64_t now = esp_timer_get_time();
+    if (now - g_last_interaction_us < 15LL * 60 * 1000 * 1000) return false;
+    if (now - g_last_proactive_us    <  5LL * 60 * 1000 * 1000) return false;
+    int cnt = 0;
+    for (int i = 0; i < 4; i++) {
+        if (g_proactive_hour[i] != 0 && now - g_proactive_hour[i] < 3600LL * 1000 * 1000) cnt++;
+    }
+    return cnt < 4;
+}
+
+static void RecordProactive() {
+    int64_t now = esp_timer_get_time();
+    g_last_proactive_us = now;
+    int oldest = 0;
+    for (int i = 1; i < 4; i++) if (g_proactive_hour[i] < g_proactive_hour[oldest]) oldest = i;
+    g_proactive_hour[oldest] = now;
+}
+
+// 低频检查 task：每 10 秒看一眼，命中就在空闲状态注入标记
+static void ProactiveTask(void* arg) {
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+        if (!ProactiveAllowed()) continue;
+        // 正在听/说/起始/执行其他 → 不打扰
+        auto st = Application::GetInstance().GetDeviceState();
+        if (st != kDeviceStateIdle) continue;
+        RecordProactive();
+        // 桥接器只认"（主动搭话）"，一字不差
+        Application::GetInstance().SendUserText("（主动搭话）");
+        ESP_LOGI(TAG, "proactive-talk -> SendUserText(（主动搭话）)");
+    }
+}
+
+static void StartProactiveCheck() {
+    xTaskCreate(ProactiveTask, "proactive_talk", 4096, nullptr, 1, nullptr);
+    ESP_LOGI(TAG, "proactive-talk task started (任务11)");
+}
+#endif
 
 class FaceTracker;
 
@@ -289,6 +349,145 @@ private:
     float smooth_x_ = 0.0f;
     float smooth_y_ = 0.0f;
     uint8_t prev_frame_[DS_W * DS_H];
+};
+
+// ---------------------------------------------------------------------------
+// 任务10 v4 · 拍前看「有没有人样」，对准了再拍（零依赖：仅用相机 YCbCr 肤色判）
+// 只在 take_photo 被调用时跑；平时什么都不做（不常驻、不盯人、不转头）。
+// 纯算法（肤色采样/统计）在 person_aim.h/.cc；这里只做「接线」：
+//   PeekFrame 取帧 → AnalyzeFrame → 按三档行动（挪正/直接拍/扫）→ 打 [PersonAim] 日志。
+// 符号约定照抄 FaceTracker::Track()（x 偏右 → yaw 减小；y 偏下 → pitch 减小），
+// 别重新发明，否则会“越挪越偏”。
+// ---------------------------------------------------------------------------
+class PersonAim {
+public:
+    void Start(EspVideo* cam, StackChanServo* servo, FaceTracker* ft) {
+        cam_ = cam; servo_ = servo; ft_ = ft;
+    }
+
+    // 拍前调用：true = 有人样可拍；false = 没找到（桥接器据此抛 no_person_in_view）
+    bool AimBeforeShot(int timeout_ms = 6000) {
+        if (!cam_ || !servo_ || !ft_) return true;   // 没接好按“能拍”处理，别卡拍照
+        int64_t t_start = esp_timer_get_time();
+        int64_t deadline = t_start + (int64_t)timeout_ms * 1000;
+
+        // 锁住 FaceTracker，别让它每 ~150ms 抢舵机（写法同 UnlockCtx）
+        ft_->SetManualLock(true);
+        ft_->Pause(false);
+        servo_->PauseScan();
+
+        int 微调 = 0, 扫轮 = 0;
+        bool found = false;
+        try {
+            for (int round = 0; round < T.max_rounds && !found; round++) {
+                if (esp_timer_get_time() > deadline) break;
+
+                FrameStat fs;
+                if (!取帧(&fs) || fs.samples == 0) 取帧(&fs);   // 首帧失败重试 1 次（总要求 3.6）
+                if (fs.samples == 0) {
+                    // 摄像头拿不到帧 → 不阻断拍照（总要求 3.6）：放行去拍
+                    found = true;
+                    break;
+                }
+                打采样日志(fs);
+
+                if (fs.hit_strong || fs.hit_weak) {
+                    if (fs.hit_strong) {
+                        // 强命中：偏得厉害就小步挪正（死区 ±deadzone，最多 nudge_times 次）→ 拍
+                        for (int i = 0;
+                             i < T.nudge_times &&
+                             (fabsf(fs.dx) > T.deadzone || fabsf(fs.dy) > T.deadzone);
+                             i++) {
+                            aim_yaw_   = clampf(aim_yaw_   - fs.dx * 6.0f, -45, 45);  // 符号照抄 FaceTracker
+                            aim_pitch_ = clampf(aim_pitch_ - fs.dy * 4.0f,  5, 60);
+                            微调++;
+                            ESP_LOGI(TAG, "[PersonAim] 微调#%d → MoveTo(yaw=%d pitch=%d) 帧内 dx=%+.2f",
+                                     微调, (int)aim_yaw_, (int)aim_pitch_, fs.dx);
+                            servo_->MoveTo((int)aim_yaw_, (int)aim_pitch_, 150);
+                            vTaskDelay(pdMS_TO_TICKS(150));    // 挪完等 150ms 再取（旧曝光，总要求 3.3）
+                            取帧(&fs);                         // 刷新偏移：够准就不再挪
+                        }
+                    }
+                    // 强命中挪完 / 弱命中直接拍（别磨叽）
+                    found = true;
+                    break;
+                }
+
+                // 没命中 → 慢扫 ±scan_deg 找（最多 max_rounds 轮）
+                if (round + 1 < T.max_rounds) { 扫一轮(round & 1, round + 1, &扫轮); }
+            }
+        } catch (...) {
+            // 异常也要走收尾，别把 FaceTracker 锁死（v4 第 3 节）
+        }
+
+        // 收尾：恢复正常跟踪（正常、异常都必须走）
+        ft_->SetManualLock(false);
+        ft_->Resume();
+        servo_->ResumeScan();
+
+        int64_t ms = (esp_timer_get_time() - t_start) / 1000;
+        ESP_LOGI(TAG, "[PersonAim] 结束：结果=%s | 微调 %d 次 | 扫 %d 轮 | 总耗时 %lldms",
+                 found ? "拍了" : "没找到", 微调, 扫轮, (long long)ms);
+        return found;
+    }
+
+private:
+    static float clampf(float v, float lo, float hi) {
+        return v < lo ? lo : (v > hi ? hi : v);
+    }
+
+    // 从相机“偷看”一帧，跑纯算法（回调里不做事，只采样；AnalyzeFrame 开销很小）
+    bool 取帧(FrameStat* out) {
+        // 丢第 1 帧（可能是旧缓存帧），用第 2 帧（总要求 3.3）
+        cam_->PeekFrame([](const uint8_t*, size_t, uint16_t, uint16_t){});
+        bool got = false;
+        int64_t t0 = esp_timer_get_time();
+        cam_->PeekFrame([&](const uint8_t* data, size_t len, uint16_t w, uint16_t h) {
+            if (w == 0 || h == 0) return;
+            *out = AnalyzeFrame(data, len, w, h, T);
+            got = true;
+        });
+        out->ms = (float)(esp_timer_get_time() - t0) / 1000.0f;
+        return got;
+    }
+
+    // [PersonAim] 采样日志（调阈值全靠它，v4 第四节 / CI 清单 Q1）
+    void 打采样日志(const FrameStat& fs) {
+        ESP_LOGI(TAG, "[PersonAim] 帧 %dx%d 采样 %d | 肤色 %d (%.1f%%) | bbox %dx%d 比 %.2f | "
+                      "dx=%+.2f dy=%+.2f | %s | 用时 %dms",
+                 fs.w, fs.h, fs.samples, fs.skin, fs.ratio * 100.0f,
+                 fs.bbox_w, fs.bbox_h, fs.bbox_ratio,
+                 fs.dx, fs.dy,
+                 fs.hit_strong ? "强命中→挪正" : (fs.hit_weak ? "弱命中→直接拍" : "没命中→扫"),
+                 (int)fs.ms);
+    }
+
+    // 慢扫一轮：从 aim_yaw_ 朝一个方向扫到 ±scan_deg，每步停下来看一眼
+    void 扫一轮(bool reverse, int round, int* 扫轮) {
+        float dir = reverse ? -1.0f : 1.0f;
+        for (int s = 1; s <= T.scan_steps; s++) {
+            aim_yaw_ = T.scan_deg * dir * (float)s / T.scan_steps;
+            (*扫轮)++;
+            servo_->MoveTo((int)aim_yaw_, (int)aim_pitch_, 150);
+            vTaskDelay(pdMS_TO_TICKS(150));
+            FrameStat fs;
+            if (取帧(&fs)) {
+                ESP_LOGI(TAG, "[PersonAim] 扫第%d轮 第%d步 → MoveTo(yaw=%d) 帧内 dx=%+.2f",
+                         round, s, (int)aim_yaw_, fs.dx);
+                打采样日志(fs);
+                if (fs.hit || fs.ratio >= T.ratio_min) { aim_yaw_ = 0; return; }  // 扫到 → 停
+            }
+        }
+        aim_yaw_ = 0;   // 这轮没扫到 → 回中，等下一轮反方向
+    }
+
+    EspVideo* cam_ = nullptr;
+    StackChanServo* servo_ = nullptr;
+    FaceTracker* ft_ = nullptr;
+    float aim_yaw_ = 0.0f;      // 拍前对焦当前 yaw（挪正/扫描都维护它，符号照抄 FaceTracker）
+    float aim_pitch_ = 30.0f;   // 拍前对焦当前 pitch
+    // 阈值集中（person_aim.h 里的 AimTuning 默认值）；C++17 inline 静态成员保默认值
+    static inline AimTuning T;
 };
 
 struct ServoAnimCtx {
@@ -1346,6 +1545,7 @@ private:
     EspVideo* camera_;
     StackChanServo servo_;
     FaceTracker face_tracker_;
+    PersonAim person_aim_;   // 任务10v4：拍前看「有没有人样」
     esp_timer_handle_t touchpad_timer_;
     esp_timer_handle_t batt_timer_ = nullptr;
     PowerSaveTimer* power_save_timer_;
@@ -1421,12 +1621,12 @@ private:
         //   - 1 秒内出现 ≥3 次"动"尖峰 → 摇晃
         //   - 连续 ≥5 个样本（500ms）持续偏离 → 抱起
         //   - 触发后 disarm，必须连续静止 1 秒（10 个样本）才 re-arm
-        const float MOTION_THRESHOLD = 0.3f;       // delta 或 mag 偏离 1g 超过此值算"动"
-        const int SHAKE_PEAKS_TO_TRIGGER = 2;      // 1 秒内 2 个尖峰算摇晃
+        const float MOTION_THRESHOLD = 0.25f;      // 轻轻摇也能被认到（任务8）
+        const int SHAKE_PEAKS_TO_TRIGGER = 2;      // 1 秒内 2 个尖峰算摇晃（保持，别太灵）
         const int64_t SHAKE_WINDOW_US = 1000 * 1000;
         const int LIFT_SAMPLES_TO_TRIGGER = 5;
-        const int STILL_SAMPLES_TO_REARM = 50;     // 5 秒静止才允许下次触发
-        const int64_t GLOBAL_COOLDOWN_US = 5 * 60 * 1000 * 1000LL;  // 触发后 5 分钟全局冷却
+        const int STILL_SAMPLES_TO_REARM = 10;     // 静止 1 秒（10 个样本）就能再次响应（任务8）
+        const int64_t GLOBAL_COOLDOWN_US = 15 * 1000 * 1000LL;  // 触发后 15 秒冷却（任务8，想摇就摇）
 
         int lift_count = 0;
         int still_count = 0;
@@ -1661,16 +1861,25 @@ private:
         si12t_last_state_ = si12t_dev_ ? Si12tReadReg(0x10) : 0;
 
         int64_t last_touch_time = 0;
-        const int64_t TOUCH_COOLDOWN_US = 5000000;  // 5 秒冷却
+        const int64_t TOUCH_COOLDOWN_US = 30000000;  // 30 秒冷却（任务9②）
+        unsigned confirm[3] = {0, 0, 0};   // 同一 zone 连续 3 帧确认真摸（任务9①）
+        int dbg = 0;
         while (true) {
             vTaskDelay(pdMS_TO_TICKS(100));
             if (!si12t_dev_) continue;
             uint8_t out = Si12tReadReg(0x10);
             int64_t now = esp_timer_get_time();
+            // 诊断日志：每约 2 秒（20×100ms）打一次 SI12T 原值，定位到底是哪个 zone 在抖（任务9④）
+            if (++dbg % 20 == 0) ESP_LOGI(TAG, "SI12T raw=0x%02X", out);
             for (int zone = 0; zone < 3; zone++) {
                 uint8_t cur = (out >> (zone * 2)) & 0x03;
-                uint8_t prev = (si12t_last_state_ >> (zone * 2)) & 0x03;
-                if (cur != 0 && prev == 0 && (now - last_touch_time > TOUCH_COOLDOWN_US)) {
+                // 3 帧确认：持续读到"触摸"才累计；中途掉一帧就清零重来（任务9①）
+                if (cur != 0) {
+                    if (confirm[zone] < 3) confirm[zone]++;
+                } else {
+                    confirm[zone] = 0;
+                }
+                if (confirm[zone] == 3 && (now - last_touch_time > TOUCH_COOLDOWN_US)) {
                     // display = 屏幕展示的完整动作描写（带括号，作为场景旁白）
                     // tag    = 发给 LLM 的短动作标签（≤6 字），避开 detect.text 长度限制
                     struct TouchMsg { const char* display; const char* tag; };
@@ -1689,6 +1898,7 @@ private:
                         disp->SetChatMessage("user", m.display);
                     }
                     SendUserMessage(m.tag);
+                    confirm[zone] = 0;   // 触发后清零：等下一次完整的 3 帧（任务9①）
                     last_touch_time = now;
                     break;
                 }
@@ -2116,6 +2326,9 @@ private:
         if (!msg) return;
         // SendUserText 内部处理状态分流：Idle 走 WakeWord 建 channel，对话中走 SendWakeWordDetected 不打断
         Application::GetInstance().SendUserText(msg);
+#if PROACTIVE_TALK
+        RecordInteraction();   // 任何一次走服务端的互动都刷新冷场计时（任务11）
+#endif
     }
 
     void PollTouchpad() {
@@ -2365,12 +2578,18 @@ public:
             servo_.SetFaceTracker(&face_tracker_);
             avatar_display->SetFaceTracker(&face_tracker_);
         }
+        // 任务10v4：挂拍前对焦钩子（没注册 = 其它板子拍照行为不变）
+        person_aim_.Start(camera_, &servo_, &face_tracker_);
+        SetPreShotAim([this]() { return person_aim_.AimBeforeShot(6000); });
         avatar_display->SetLedUpdater([this](const char* emotion) {
             UpdateLedsFromEmotion(emotion);
         });
         InitializeFt6336TouchPad();
         InitializeBmi270();
         InitializeSi12T();
+#if PROACTIVE_TALK
+        StartProactiveCheck();   // 安静 15 分钟主动搭话（任务11）
+#endif
         // Morning greeting + weather timer task removed; no-op call removed too
 
         esp_timer_create_args_t status_args = {};

@@ -341,4 +341,8 @@ private:
     std::vector<McpTool*> tools_;
 };
 
+// ---- 任务10v4：拍前对焦钩子（板级可选注册；不注册 = 原有拍照行为不变）----
+using PreShotAimFn = std::function<bool()>;
+void SetPreShotAim(PreShotAimFn fn);
+
 #endif // MCP_SERVER_H

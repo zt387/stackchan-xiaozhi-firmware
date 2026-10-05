@@ -20,6 +20,10 @@
 
 #define TAG "MCP"
 
+// ---- 任务10v4：拍前对焦钩子（板级可选注册；不注册 = 原有拍照行为不变）----
+static std::function<bool()> g_pre_shot_aim;
+void SetPreShotAim(std::function<bool()> fn) { g_pre_shot_aim = std::move(fn); }
+
 McpServer::McpServer() {
 }
 
@@ -111,6 +115,11 @@ void McpServer::AddCommonTools() {
             [camera](const PropertyList& properties) -> ReturnValue {
                 // Lower the priority to do the camera capture
                 TaskPriorityReset priority_reset(1);
+
+                // 任务10v4：拍前先看「有没有人样」（板级钩子）；没找到就抛给服务端，不拍
+                if (g_pre_shot_aim && !g_pre_shot_aim()) {
+                    throw std::runtime_error("no_person_in_view");
+                }
 
                 if (!camera->Capture()) {
                     throw std::runtime_error("Failed to capture photo");
