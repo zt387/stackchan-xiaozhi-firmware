@@ -22,6 +22,10 @@
 #include <sstream>
 #include <algorithm>
 
+#ifndef ALLOW_OTA_UPGRADE
+#define ALLOW_OTA_UPGRADE 1
+#endif
+
 #define TAG "Ota"
 
 
@@ -230,11 +234,11 @@ esp_err_t Ota::CheckVersion() {
             } else {
                 ESP_LOGI(TAG, "Current is the latest version");
             }
-            // User request: do NOT auto-install. Force has_new_version_ = false
-            // regardless of what the server says, so the application never
-            // calls UpgradeFirmware. To update firmware, reflash via idf.py.
+#if ALLOW_OTA_UPGRADE
+            has_new_version_ = is_newer;
+#else
             has_new_version_ = false;
-            (void)is_newer;  // version comparison kept for logging only
+#endif
             // If the force flag is set to 1, the given version is forced to be installed
             cJSON *force = cJSON_GetObjectItem(firmware, "force");
             if (cJSON_IsNumber(force) && force->valueint == 1) {
