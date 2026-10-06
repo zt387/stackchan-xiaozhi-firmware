@@ -116,9 +116,16 @@ void McpServer::AddCommonTools() {
                 // Lower the priority to do the camera capture
                 TaskPriorityReset priority_reset(1);
 
-                // 任务10v4：拍前先看「有没有人样」（板级钩子）；没找到就抛给服务端，不拍
+                // 任务10v4 / v7：拍前先看「有没有人样」（板级钩子）
+                // ⚠️ 不能抛异常！抛异常会被服务端自己念成「MCP错误：xxx」，
+                //    且不会再当工具结果回问模型 → 桥接器收不到 → D先 没机会说话。
+                //    改成【正常返回】一段带标记的文本，服务端会当普通工具结果再问模型，
+                //    桥接器的「工具报没找到人」分支就会命中，让 D先 现场说一句。
                 if (g_pre_shot_aim && !g_pre_shot_aim()) {
-                    throw std::runtime_error("no_person_in_view");
+                    return std::string(
+                        "NO_PERSON_IN_VIEW | 拍前没找到人，所以没有拍照。"
+                        "（这是结果不是错误）请用你自己的话，自然地对她说一句，"
+                        "让她知道你在找她、这次没看到她；别提'人脸检测/工具/报错'这类字眼。");
                 }
 
                 if (!camera->Capture()) {
