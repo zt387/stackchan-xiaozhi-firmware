@@ -376,7 +376,7 @@ public:
         ft_->Pause(false);
         servo_->PauseScan();
 
-        int 微调 = 0, 扫轮 = 0;
+        int 微调 = 0, 扫步 = 0, 已扫轮 = 0;
         bool found = false;
         try {
             for (int round = 0; round < T.max_rounds && !found; round++) {
@@ -413,8 +413,9 @@ public:
                     break;
                 }
 
-                // 没命中 → 慢扫 ±scan_deg 找（最多 max_rounds 轮）
-                if (round + 1 < T.max_rounds) { 扫一轮(round & 1, round + 1, &扫轮); }
+                // 没命中 → 明显扫一轮（双向 ±30°，看得见）
+                已扫轮++;
+                if (扫一轮(已扫轮, &扫步)) { found = true; break; }
             }
         } catch (...) {
             // 异常也要走收尾，别把 FaceTracker 锁死（v4 第 3 节）
@@ -426,8 +427,8 @@ public:
         servo_->ResumeScan();
 
         int64_t ms = (esp_timer_get_time() - t_start) / 1000;
-        ESP_LOGI(TAG, "[PersonAim] 结束：结果=%s | 微调 %d 次 | 扫 %d 轮 | 总耗时 %lldms",
-                 found ? "拍了" : "没找到", 微调, 扫轮, (long long)ms);
+        ESP_LOGI(TAG, "[PersonAim] 结束：结果=%s | 微调 %d 次 | 扫 %d 步 / %d 轮 | 总耗时 %dms",
+                 found ? "拍了" : "没找到", 微调, 扫步, 已扫轮, (int)ms);
         return found;
     }
 
@@ -462,23 +463,25 @@ private:
                  (int)fs.ms);
     }
 
-    // 慢扫一轮：从 aim_yaw_ 朝一个方向扫到 ±scan_deg，每步停下来看一眼
-    void 扫一轮(bool reverse, int round, int* 扫轮) {
-        float dir = reverse ? -1.0f : 1.0f;
-        for (int s = 1; s <= T.scan_steps; s++) {
-            aim_yaw_ = T.scan_deg * dir * (float)s / T.scan_steps;
-            (*扫轮)++;
-            servo_->MoveTo((int)aim_yaw_, (int)aim_pitch_, 150);
-            vTaskDelay(pdMS_TO_TICKS(150));
+    // 明显扫一轮：一侧扫到头(+30°) → 回中 → 另一侧扫到头(-30°) → 回中
+    // 每步停 scan_step_ms（250ms），让「扭头找人」一眼看得见。返回 true = 扫到人样。
+    bool 扫一轮(int round, int* 扫步) {
+        static const int 角[] = {30, 20, 10, 0, -10, -20, -30};   // 先右、回中、再左
+        for (int k = 0; k < 7; k++) {
+            aim_yaw_ = (float)角[k];
+            (*扫步)++;
+            servo_->MoveTo(角[k], (int)aim_pitch_, T.scan_step_ms);
+            vTaskDelay(pdMS_TO_TICKS(T.scan_step_ms));
             FrameStat fs;
             if (取帧(&fs)) {
                 ESP_LOGI(TAG, "[PersonAim] 扫第%d轮 第%d步 → MoveTo(yaw=%d) 帧内 dx=%+.2f",
-                         round, s, (int)aim_yaw_, fs.dx);
+                         round, *扫步, 角[k], fs.dx);
                 打采样日志(fs);
-                if (fs.hit || fs.ratio >= T.ratio_min) { aim_yaw_ = 0; return; }  // 扫到 → 停
+                if (fs.hit || fs.ratio >= T.ratio_min) { aim_yaw_ = 0; return true; }  // 扫到 → 停
             }
         }
-        aim_yaw_ = 0;   // 这轮没扫到 → 回中，等下一轮反方向
+        aim_yaw_ = 0;   // 这轮没扫到 → 回中
+        return false;
     }
 
     EspVideo* cam_ = nullptr;

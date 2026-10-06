@@ -36,6 +36,7 @@ struct AimTuning {
     int    scan_deg = 30;
     int    scan_steps = 6;
     int    step_delay_ms = 150;
+    int    scan_step_ms = 250;        // 扫描每步停留（明显、看得见）
     int    max_rounds = 2;
 
     // —— 采样步距：每 4 像素取 1 组（320x240 → 80x60 = 4800 点，几毫秒）——
